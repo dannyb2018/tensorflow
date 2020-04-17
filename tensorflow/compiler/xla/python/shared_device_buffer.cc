@@ -15,32 +15,46 @@ limitations under the License.
 
 #include "tensorflow/compiler/xla/python/shared_device_buffer.h"
 
+#include <iterator>
 #include <memory>
 
+#include "absl/synchronization/mutex.h"
+#include "tensorflow/compiler/xla/python/local_device_state.h"
+#include "tensorflow/compiler/xla/service/shaped_buffer.h"
+#include "tensorflow/compiler/xla/types.h"
+#include "tensorflow/stream_executor/device_memory.h"
 #include "tensorflow/stream_executor/device_memory_allocator.h"
+#include "tensorflow/stream_executor/event.h"
+#include "tensorflow/stream_executor/stream.h"
 
 namespace xla {
 
-/*static*/ StatusOr<std::shared_ptr<BufferDefinitionEvent>>
-BufferDefinitionEvent::Create(se::StreamExecutor* executor) {
-  auto event = std::make_shared<BufferDefinitionEvent>(executor);
-  TF_RET_CHECK(event->event_.Init())
-      << "Buffer definition event initialization failed";
-  return event;
+void BufferDefinitionEvent::SetDefinitionEvent(EventPool::Handle event,
+                                               se::Stream* stream) {
+  absl::MutexLock lock(&mu_);
+  CHECK(!event_.event());
+  event_ = std::move(event);
+  CHECK(streams_defined_on_.empty());
+  streams_defined_on_.push_back(stream);
 }
 
-BufferDefinitionEvent::BufferDefinitionEvent(se::StreamExecutor* executor)
-    : event_(executor) {}
+bool BufferDefinitionEvent::EventHasBeenRecorded() const {
+  return event_.event() != nullptr;
+}
 
-void BufferDefinitionEvent::RecordOnStream(se::Stream* stream) {
+uint64 BufferDefinitionEvent::sequence_number() const {
   absl::MutexLock lock(&mu_);
-  CHECK(streams_defined_on_.empty());
-  stream->ThenRecordEvent(&event_);
-  streams_defined_on_.push_back(stream);
+  CHECK(EventHasBeenRecorded());
+  return event_.sequence_number();
 }
 
 void BufferDefinitionEvent::WaitForEventOnStream(se::Stream* stream) {
   absl::MutexLock lock(&mu_);
+
+  // We cannot wait for an event until ThenRecordEvent has been called; on GPU
+  // newly created events are deemed to have already happened past.
+  mu_.Await(
+      absl::Condition(this, &BufferDefinitionEvent::EventHasBeenRecorded));
 
   // The set of defined streams is expected to be very small indeed (usually
   // 1-2), so a simple linear scan should be fast enough.
@@ -50,142 +64,181 @@ void BufferDefinitionEvent::WaitForEventOnStream(se::Stream* stream) {
     return;
   }
 
-  stream->ThenWaitFor(&event_);
+  stream->ThenWaitFor(event_.event());
   streams_defined_on_.push_back(stream);
 }
 
-static std::shared_ptr<PySharedDeviceBuffer>
-BufferFromScopedShapedBufferIterator(
-    const Shape& on_device_shape, int device_ordinal,
-    se::DeviceMemoryAllocator* allocator,
-    ShapeTree<se::DeviceMemoryBase>::iterator* iterator,
-    const ShapeTree<se::DeviceMemoryBase>::iterator& end,
-    const std::shared_ptr<BufferDefinitionEvent>& definition_event) {
-  CHECK(*iterator != end);
+bool BufferDefinitionEvent::DefinedOn(se::Stream* stream) {
+  absl::MutexLock lock(&mu_);
 
-  se::OwningDeviceMemory device_memory((*iterator)->second, device_ordinal,
-                                       allocator);
-  (*iterator)->second = se::DeviceMemoryBase();
-  ++*iterator;
+  // We cannot wait for an event until ThenRecordEvent has been called; on GPU
+  // newly created events are deemed to have already happened past.
+  mu_.Await(
+      absl::Condition(this, &BufferDefinitionEvent::EventHasBeenRecorded));
 
-  std::vector<std::shared_ptr<PySharedDeviceBuffer>> children;
-  if (on_device_shape.IsTuple()) {
-    int num_children = ShapeUtil::TupleElementCount(on_device_shape);
-    children.reserve(num_children);
-    for (int i = 0; i < num_children; ++i) {
-      children.push_back(BufferFromScopedShapedBufferIterator(
-          on_device_shape.tuple_shapes(i), device_ordinal, allocator, iterator,
-          end, definition_event));
-    }
-  }
-  return std::make_shared<PySharedDeviceBuffer>(
-      on_device_shape, std::move(device_memory), children, definition_event);
+  // The set of defined streams is expected to be very small indeed (usually
+  // 1-2), so a simple linear scan should be fast enough.
+  return std::find(streams_defined_on_.begin(), streams_defined_on_.end(),
+                   stream) != streams_defined_on_.end();
 }
 
-/* static */ std::shared_ptr<PySharedDeviceBuffer>
-PySharedDeviceBuffer::FromScopedShapedBuffer(
-    ScopedShapedBuffer shaped_buffer,
-    const std::shared_ptr<BufferDefinitionEvent>& definition_event) {
+bool BufferDefinitionEvent::IsComplete() {
+  absl::MutexLock lock(&mu_);
+
+  // We cannot wait for an event until ThenRecordEvent has been called; on
+  // GPU newly created events are deemed to have already happened past.
+  mu_.Await(
+      absl::Condition(this, &BufferDefinitionEvent::EventHasBeenRecorded));
+
+  return event_.event()->PollForStatus() == se::Event::Status::kComplete;
+}
+
+/* static */ std::shared_ptr<SharedDeviceBuffer>
+SharedDeviceBuffer::FromScopedShapedBuffer(
+    ScopedShapedBuffer* shaped_buffer,
+    absl::Span<const std::shared_ptr<BufferDefinitionEvent>>
+        definition_events) {
+  ShapeTree<se::DeviceMemoryBase>::iterator iterator =
+      shaped_buffer->buffers().begin();
+  std::vector<se::DeviceMemoryBase> buffers;
+  buffers.reserve(1);
+
+  ShapeUtil::ForEachSubshape(
+      shaped_buffer->on_device_shape(), [&](const Shape&, const ShapeIndex&) {
+        CHECK(iterator != shaped_buffer->buffers().end());
+        buffers.push_back(iterator->second);
+        iterator->second = se::DeviceMemoryBase();
+        ++iterator;
+      });
+  CHECK(iterator == shaped_buffer->buffers().end());
+  return std::make_shared<SharedDeviceBuffer>(
+      shaped_buffer->memory_allocator(), shaped_buffer->device_ordinal(),
+      absl::Span<se::DeviceMemoryBase>(buffers), definition_events,
+      /*on_delete_callback=*/nullptr);
+}
+
+ShapedBuffer SharedDeviceBuffer::AsShapedBuffer(const Shape& on_host_shape,
+                                                const Shape& on_device_shape,
+                                                se::Platform* platform) const {
+  ShapedBuffer shaped_buffer(on_host_shape, on_device_shape, platform,
+                             device_ordinal_);
   ShapeTree<se::DeviceMemoryBase>::iterator iterator =
       shaped_buffer.buffers().begin();
-  std::shared_ptr<PySharedDeviceBuffer> output =
-      BufferFromScopedShapedBufferIterator(
-          shaped_buffer.on_device_shape(), shaped_buffer.device_ordinal(),
-          shaped_buffer.memory_allocator(), &iterator,
-          shaped_buffer.buffers().end(), definition_event);
-  CHECK(iterator == shaped_buffer.buffers().end());
-  return output;
-}
-
-/* static */ StatusOr<std::shared_ptr<PySharedDeviceBuffer>>
-PySharedDeviceBuffer::MakeTuple(
-    std::vector<std::shared_ptr<PySharedDeviceBuffer>> children,
-    TransferManager* transfer_manager, se::DeviceMemoryAllocator* allocator,
-    int device_ordinal,
-    std::shared_ptr<BufferDefinitionEvent> definition_event) {
-  std::vector<Shape> child_shapes;
-  child_shapes.reserve(children.size());
-  for (const auto& child : children) {
-    TF_RET_CHECK(child->device_memory().device_ordinal() == device_ordinal);
-    child_shapes.push_back(child->on_device_shape());
+  for (const se::DeviceMemoryBase& buf : device_memory_) {
+    CHECK(iterator != shaped_buffer.buffers().end());
+    iterator->second = buf;
+    ++iterator;
   }
-
-  Shape shape = ShapeUtil::MakeTupleShape(child_shapes);
-  TF_ASSIGN_OR_RETURN(
-      se::OwningDeviceMemory device_memory,
-      allocator->Allocate(device_ordinal,
-                          transfer_manager->GetByteSizeRequirement(shape)));
-  return std::make_shared<PySharedDeviceBuffer>(
-      std::move(shape), std::move(device_memory), std::move(children),
-      std::move(definition_event));
-}
-
-/* static */ StatusOr<std::shared_ptr<PySharedDeviceBuffer>>
-PySharedDeviceBuffer::MakeArray(
-    Shape on_device_shape, TransferManager* transfer_manager,
-    se::DeviceMemoryAllocator* allocator, int device_ordinal,
-    std::shared_ptr<BufferDefinitionEvent> definition_event) {
-  TF_ASSIGN_OR_RETURN(
-      se::OwningDeviceMemory device_memory,
-      allocator->Allocate(
-          device_ordinal,
-          transfer_manager->GetByteSizeRequirement(on_device_shape)));
-  return std::make_shared<PySharedDeviceBuffer>(
-      std::move(on_device_shape), std::move(device_memory),
-      /*children=*/std::vector<std::shared_ptr<PySharedDeviceBuffer>>{},
-      std::move(definition_event));
-}
-
-// Populates a buffer tree from a ShapeTree iterator.
-static void PopulateShapedBufferFromBuffer(
-    const PySharedDeviceBuffer& buffer,
-    ShapeTree<se::DeviceMemoryBase>::iterator* iterator,
-    const ShapeTree<se::DeviceMemoryBase>::iterator& end) {
-  CHECK(*iterator != end);
-  (*iterator)->second = *buffer.device_memory();
-  ++*iterator;
-  for (const auto& child : buffer.children()) {
-    PopulateShapedBufferFromBuffer(*child, iterator, end);
-  }
-}
-
-ShapedBuffer PySharedDeviceBuffer::AsShapedBuffer(
-    const Shape& on_host_shape) const {
-  ShapedBuffer shaped_buffer(on_host_shape, on_device_shape_,
-                             device_memory_.allocator()->platform(),
-                             device_memory_.device_ordinal());
-  ShapeTree<se::DeviceMemoryBase>::iterator iterator =
-      shaped_buffer.buffers().begin();
-  PopulateShapedBufferFromBuffer(*this, &iterator,
-                                 shaped_buffer.buffers().end());
   CHECK(iterator == shaped_buffer.buffers().end());
   return shaped_buffer;
 }
 
-PySharedDeviceBuffer::PySharedDeviceBuffer(
-    Shape on_device_shape, se::OwningDeviceMemory device_memory,
-    std::vector<std::shared_ptr<PySharedDeviceBuffer>> children,
-    std::shared_ptr<BufferDefinitionEvent> definition_event)
-    : on_device_shape_(std::move(on_device_shape)),
-      device_memory_(std::move(device_memory)),
-      children_(std::move(children)),
-      definition_event_(std::move(definition_event)) {}
+// See comment on ExecutionInput in xla/service/executable.h to understand
+// the meaning of owned/unowned in that class.
 
-void GetDeviceBufferDefinitionEvents(
-    const PySharedDeviceBuffer& buffer,
-    absl::flat_hash_set<BufferDefinitionEvent*>* events) {
-  if (buffer.definition_event()) {
-    events->insert(buffer.definition_event().get());
-  }
-  for (const auto& child : buffer.children()) {
-    GetDeviceBufferDefinitionEvents(*child, events);
+void SharedDeviceBuffer::AddToInputAsImmutable(
+    ShapeTree<MaybeOwningDeviceMemory>::iterator* iterator,
+    const ShapeTree<MaybeOwningDeviceMemory>::iterator& end) const {
+  for (const se::DeviceMemoryBase& buf : device_memory_) {
+    CHECK(*iterator != end);
+    // Set buffers to be case (1) in the comment on ExecutionInput.
+    (*iterator)->second = MaybeOwningDeviceMemory(buf);
+    ++(*iterator);
   }
 }
 
-void WaitForBufferDefinitionEventsOnStream(const PySharedDeviceBuffer& buffer,
+void SharedDeviceBuffer::AddToInputAsDonated(
+    ShapeTree<MaybeOwningDeviceMemory>::iterator* iterator,
+    const ShapeTree<MaybeOwningDeviceMemory>::iterator& end,
+    ExecutionInput* execution_input,
+    se::DeviceMemoryAllocator* allocator) const {
+  for (const se::DeviceMemoryBase& buf : device_memory_) {
+    CHECK(*iterator != end);
+    // Set buffers to be case (2) in the comment on ExecutionInput.
+    (*iterator)->second = MaybeOwningDeviceMemory(
+        se::OwningDeviceMemory(buf, device_ordinal_, allocator));
+    execution_input->SetUnownedIndex((*iterator)->first);
+    ++(*iterator);
+  }
+}
+
+namespace {
+
+using MoveIterator =
+    absl::Span<const std::shared_ptr<BufferDefinitionEvent>>::iterator;
+
+}  // namespace
+
+SharedDeviceBuffer::SharedDeviceBuffer(
+    se::DeviceMemoryAllocator* allocator, int device_ordinal,
+    absl::Span<se::DeviceMemoryBase const> device_memory,
+    absl::Span<const std::shared_ptr<BufferDefinitionEvent>> definition_events,
+    std::function<void()> on_delete_callback)
+    : allocator_(allocator),
+      device_ordinal_(device_ordinal),
+      device_memory_(device_memory.begin(), device_memory.end()),
+      definition_events_(
+          std::move_iterator<MoveIterator>(definition_events.begin()),
+          std::move_iterator<MoveIterator>(definition_events.end())),
+      in_use_(true),
+      on_delete_callback_(std::move(on_delete_callback)) {}
+
+SharedDeviceBuffer::~SharedDeviceBuffer() {
+  if (allocator_) {
+    for (const se::DeviceMemoryBase& buffer : device_memory_) {
+      Status status = allocator_->Deallocate(device_ordinal_, buffer);
+      if (!status.ok()) {
+        LOG(ERROR) << "Buffer deallocation failed: " << status;
+      }
+    }
+  }
+  if (on_delete_callback_) {
+    on_delete_callback_();
+  }
+}
+
+void SharedDeviceBuffer::AddUsageEvent(
+    se::Stream* usage_stream, std::shared_ptr<BufferDefinitionEvent> event,
+    bool reference_held) {
+  CHECK(in_use_);
+
+  for (auto& existing : usage_events_) {
+    if (existing.stream == usage_stream) {
+      if (*existing.event < *event) {
+        existing.event = event;
+        existing.reference_held = reference_held;
+      }
+      return;
+    }
+  }
+  usage_events_.push_back({usage_stream, event, reference_held});
+}
+
+SharedDeviceBuffer::StreamAndEventContainer
+SharedDeviceBuffer::LockUseAndTransferUsageEvents() {
+  CHECK(in_use_);
+  in_use_ = false;
+  return std::move(usage_events_);
+}
+
+void GetDeviceBufferEvents(
+    const SharedDeviceBuffer& buffer, bool get_usage_events,
+    absl::flat_hash_set<BufferDefinitionEvent*>* events) {
+  if (get_usage_events) {
+    for (const auto& e : buffer.usage_events()) {
+      events->insert(e.event.get());
+    }
+  } else {
+    for (const auto& e : buffer.definition_events()) {
+      events->insert(e.get());
+    }
+  }
+}
+
+void WaitForBufferDefinitionEventsOnStream(const SharedDeviceBuffer& buffer,
                                            se::Stream* stream) {
   absl::flat_hash_set<BufferDefinitionEvent*> events;
-  GetDeviceBufferDefinitionEvents(buffer, &events);
+  GetDeviceBufferEvents(buffer, /*get_usage_events=*/false, &events);
   for (BufferDefinitionEvent* event : events) {
     event->WaitForEventOnStream(stream);
   }

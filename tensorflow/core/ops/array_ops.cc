@@ -13,7 +13,11 @@ See the License for the specific language governing permissions and
 limitations under the License.
 ==============================================================================*/
 
+#include <algorithm>
+#include <ostream>
+
 #include "tensorflow/core/framework/common_shape_fns.h"
+#include "tensorflow/core/framework/kernel_shape_util.h"
 #include "tensorflow/core/framework/op.h"
 #include "tensorflow/core/framework/shape_inference.h"
 #include "tensorflow/core/framework/tensor.pb.h"
@@ -152,7 +156,7 @@ Status TransposeShapeFn(InferenceContext* c) {
   TF_RETURN_IF_ERROR(c->WithValue(perm_elems, rank, &perm_elems));
 
   // If we know the rank of the input and the value of perm, we can return
-  // all shape informantion, otherwise we can only return rank information,
+  // all shape information, otherwise we can only return rank information,
   // but no information for the dimensions.
   if (perm != nullptr) {
     std::vector<int64> data;
@@ -190,8 +194,7 @@ Status SetOutputShapeForReshape(InferenceContext* c) {
     c->set_output(0, out);
     return Status::OK();
   }
-
-  if (c->RankKnown(out) && c->RankKnown(in)) {
+  if (c->RankKnown(in)) {
     // We don't know the number of output elements, but we can try to infer
     // the missing dimension.
     bool too_many_unknown = false;
@@ -827,6 +830,29 @@ REGISTER_OP("MatrixDiag")
       return Status::OK();
     });
 
+REGISTER_OP("MatrixDiagV2")
+    .Input("diagonal: T")
+    .Input("k: int32")
+    .Input("num_rows: int32")
+    .Input("num_cols: int32")
+    .Input("padding_value: T")
+    .Output("output: T")
+    .Attr("T: type")
+    .SetShapeFn(shape_inference::MatrixDiagV2Shape);
+
+REGISTER_OP("MatrixDiagV3")
+    .Input("diagonal: T")
+    .Input("k: int32")
+    .Input("num_rows: int32")
+    .Input("num_cols: int32")
+    .Input("padding_value: T")
+    .Output("output: T")
+    .Attr("T: type")
+    .Attr(
+        "align: {'LEFT_RIGHT', 'RIGHT_LEFT', 'LEFT_LEFT', 'RIGHT_RIGHT'} = "
+        "'RIGHT_LEFT'")
+    .SetShapeFn(shape_inference::MatrixDiagV2Shape);
+
 // --------------------------------------------------------------------------
 REGISTER_OP("MatrixSetDiag")
     .Input("input: T")
@@ -850,15 +876,34 @@ REGISTER_OP("MatrixSetDiag")
       ShapeHandle output = input;
       if (c->RankKnown(diag) && !c->FullyDefined(input)) {
         // Try to infer parts of shape from diag.
-        ShapeHandle diag_prefix;
-        TF_RETURN_IF_ERROR(c->Subshape(diag, 0, -1, &diag_prefix));
+        ShapeHandle diag_batch_shape;
+        TF_RETURN_IF_ERROR(c->Subshape(diag, 0, -1, &diag_batch_shape));
         TF_RETURN_IF_ERROR(
-            c->Concatenate(diag_prefix, c->UnknownShapeOfRank(2), &diag));
+            c->Concatenate(diag_batch_shape, c->UnknownShapeOfRank(2), &diag));
         TF_RETURN_IF_ERROR(c->Merge(input, diag, &output));
       }
       c->set_output(0, output);
       return Status::OK();
     });
+
+REGISTER_OP("MatrixSetDiagV2")
+    .Input("input: T")
+    .Input("diagonal: T")
+    .Input("k: int32")
+    .Output("output: T")
+    .Attr("T: type")
+    .SetShapeFn(shape_inference::MatrixSetDiagV2Shape);
+
+REGISTER_OP("MatrixSetDiagV3")
+    .Input("input: T")
+    .Input("diagonal: T")
+    .Input("k: int32")
+    .Output("output: T")
+    .Attr("T: type")
+    .Attr(
+        "align: {'LEFT_RIGHT', 'RIGHT_LEFT', 'LEFT_LEFT', 'RIGHT_RIGHT'} = "
+        "'RIGHT_LEFT'")
+    .SetShapeFn(shape_inference::MatrixSetDiagV2Shape);
 
 // --------------------------------------------------------------------------
 REGISTER_OP("MatrixDiagPart")
@@ -884,6 +929,25 @@ REGISTER_OP("MatrixDiagPart")
       c->set_output(0, c->MakeShape(dims));
       return Status::OK();
     });
+
+REGISTER_OP("MatrixDiagPartV2")
+    .Input("input: T")
+    .Input("k: int32")
+    .Input("padding_value: T")
+    .Output("diagonal: T")
+    .Attr("T: type")
+    .SetShapeFn(shape_inference::MatrixDiagPartV2Shape);
+
+REGISTER_OP("MatrixDiagPartV3")
+    .Input("input: T")
+    .Input("k: int32")
+    .Input("padding_value: T")
+    .Output("diagonal: T")
+    .Attr("T: type")
+    .Attr(
+        "align: {'LEFT_RIGHT', 'RIGHT_LEFT', 'LEFT_LEFT', 'RIGHT_RIGHT'} = "
+        "'RIGHT_LEFT'")
+    .SetShapeFn(shape_inference::MatrixDiagPartV2Shape);
 
 // --------------------------------------------------------------------------
 REGISTER_OP("MatrixBandPart")
@@ -1228,6 +1292,14 @@ REGISTER_OP("IdentityN")
       std::vector<ShapeHandle> input;
       TF_RETURN_IF_ERROR(c->input("input", &input));
       TF_RETURN_IF_ERROR(c->set_output("output", input));
+      // If any of the input shapes are not known, we should return error.
+      for (int i = 0; i < input.size(); i++) {
+        if (!input[i].Handle()) {
+          return errors::InvalidArgument(absl::StrCat(
+              "Cannot infer output shape #", i,
+              " for IdentityN node because input shape #", i, " is unknown."));
+        }
+      }
       return Status::OK();
     });
 
@@ -1274,6 +1346,16 @@ REGISTER_OP("CheckNumerics")
     .Output("output: T")
     .Attr("T: {bfloat16, half, float, double}")
     .Attr("message: string")
+    .SetIsStateful()
+    .SetShapeFn(shape_inference::UnchangedShape);
+
+// --------------------------------------------------------------------------
+REGISTER_OP("CheckNumericsV2")
+    .Input("tensor: T")
+    .Output("output: T")
+    .Attr("T: {bfloat16, half, float, double}")
+    .Attr("message: string")
+    .SetIsStateful()
     .SetShapeFn(shape_inference::UnchangedShape);
 
 // --------------------------------------------------------------------------
@@ -1323,6 +1405,16 @@ REGISTER_OP("Transpose")
     .Attr("Tperm: {int32, int64} = DT_INT32")
     .SetShapeFn(TransposeShapeFn);
 
+#ifdef INTEL_MKL
+REGISTER_OP("_MklTranspose")
+    .Input("x: T")
+    .Input("perm: Tperm")
+    .Output("y: T")
+    .Attr("T: type")
+    .Attr("Tperm: {int32, int64} = DT_INT32")
+    .SetShapeFn(TransposeShapeFn);
+#endif  // INTEL_MKL
+
 // --------------------------------------------------------------------------
 REGISTER_OP("ConjugateTranspose")
     .Input("x: T")
@@ -1331,6 +1423,16 @@ REGISTER_OP("ConjugateTranspose")
     .Attr("T: type")
     .Attr("Tperm: {int32, int64} = DT_INT32")
     .SetShapeFn(TransposeShapeFn);
+
+#ifdef INTEL_MKL
+REGISTER_OP("_MklConjugateTranspose")
+    .Input("x: T")
+    .Input("perm: Tperm")
+    .Output("y: T")
+    .Attr("T: type")
+    .Attr("Tperm: {int32, int64} = DT_INT32")
+    .SetShapeFn(TransposeShapeFn);
+#endif  // INTEL_MKL
 
 // --------------------------------------------------------------------------
 REGISTER_OP("Unique")
@@ -1356,7 +1458,7 @@ REGISTER_OP("UniqueV2")
     .Attr("Taxis: {int32,int64} = DT_INT64")
     .Attr("out_idx: {int32, int64} = DT_INT32")
     .SetShapeFn([](InferenceContext* c) {
-      c->set_output(0, c->Vector(InferenceContext::kUnknownDim));
+      c->set_output(0, c->UnknownShapeOfRank(c->Rank(c->input(0))));
       c->set_output(1, c->input(0));
       return Status::OK();
     });
@@ -1387,10 +1489,9 @@ REGISTER_OP("UniqueWithCountsV2")
     .Attr("Taxis: {int32,int64} = DT_INT64")
     .Attr("out_idx: {int32, int64} = DT_INT32")
     .SetShapeFn([](InferenceContext* c) {
-      auto uniq = c->Vector(InferenceContext::kUnknownDim);
-      c->set_output(0, uniq);
+      c->set_output(0, c->UnknownShapeOfRank(c->Rank(c->input(0))));
       c->set_output(1, c->input(0));
-      c->set_output(2, uniq);
+      c->set_output(2, c->Vector(InferenceContext::kUnknownDim));
       return Status::OK();
     });
 
@@ -2063,8 +2164,10 @@ namespace {
 template <typename InputType>
 std::vector<int64> GetFlatInt64(const Tensor& t) {
   std::vector<int64> output(t.shape().num_elements());
-  auto eigen_vec = t.flat<InputType>();
-  std::copy_n(&eigen_vec(0), output.size(), output.begin());
+  if (t.shape().num_elements() > 0) {
+    auto eigen_vec = t.flat<InputType>();
+    std::copy_n(&eigen_vec(0), output.size(), output.begin());
+  }
   return output;
 }
 
@@ -2101,7 +2204,7 @@ Status SpaceToBatchShapeHelper(InferenceContext* c, ShapeHandle input_shape,
 
   DimensionHandle batch_size = c->Dim(input_shape, 0);
   std::vector<int64> block_shape_vec;
-  if (block_shape_t) {
+  if (block_shape_t && (block_shape_t->NumElements() > 0)) {
     block_shape_vec = GetFlatInt64(*block_shape_t);
     for (int64 dim = 0; dim < num_block_dims; ++dim) {
       const int64 block_shape_value = block_shape_vec[dim];
@@ -2122,7 +2225,7 @@ Status SpaceToBatchShapeHelper(InferenceContext* c, ShapeHandle input_shape,
   std::vector<DimensionHandle> output_dims{batch_size};
   output_dims.resize(num_block_dims + 1, c->UnknownDim());
 
-  if (paddings_t) {
+  if (paddings_t && (paddings_t->NumElements() > 0)) {
     const std::vector<int64> paddings_vec = GetFlatInt64(*paddings_t);
     for (int64 dim = 0; dim < num_block_dims; ++dim) {
       const int64 pad_start = paddings_vec[dim * 2],
@@ -2424,7 +2527,9 @@ REGISTER_OP("ExtractImagePatches")
     .Attr("ksizes: list(int) >= 4")
     .Attr("strides: list(int) >= 4")
     .Attr("rates: list(int) >= 4")
-    .Attr("T: realnumbertype")
+    .Attr(
+        "T: {bfloat16, half, float, double, int8, int16, int32, int64, "
+        "uint8, uint16, uint32, uint64, complex64, complex128, bool}")
     .Attr(GetPaddingAttrString())
     .SetShapeFn([](InferenceContext* c) {
       ShapeHandle input_shape;
@@ -2615,69 +2720,6 @@ REGISTER_OP("ExtractVolumePatches")
 
 // --------------------------------------------------------------------------
 
-REGISTER_OP("Bitcast")
-    .Input("input: T")
-    .Output("output: type")
-    // All supported dtypes are listed here to include qint16, quint16, uint32,
-    // and uint64.
-    .Attr(
-        "T: {bfloat16, half, float, double, int64, int32, uint8, uint16, "
-        "uint32, uint64, int8, int16, complex64, complex128, qint8, quint8, "
-        "qint16, quint16, qint32}")
-    .Attr(
-        "type: {bfloat16, half, float, double, int64, int32, uint8, uint16, "
-        "uint32, uint64, int8, int16, complex64, complex128, qint8, quint8, "
-        "qint16, quint16, qint32}")
-    .SetShapeFn([](InferenceContext* c) {
-      ShapeHandle input = c->input(0);
-      if (!c->RankKnown(input)) {
-        // Input shape unknown.
-        return shape_inference::UnknownShape(c);
-      }
-
-      // Find the size of the input and output data types.
-      DataType input_type;
-      DataType output_type;
-      TF_RETURN_IF_ERROR(c->GetAttr("T", &input_type));
-      TF_RETURN_IF_ERROR(c->GetAttr("type", &output_type));
-      const int input_type_size = DataTypeSize(input_type);
-      const int output_type_size = DataTypeSize(output_type);
-
-      if (input_type_size == 0 || output_type_size == 0) {
-        return errors::InvalidArgument("Cannot bitcast types ",
-                                       DataTypeString(input_type), " to ",
-                                       DataTypeString(output_type),
-                                       " because "
-                                       "one of the type sizes is zero.");
-      }
-
-      ShapeHandle new_shape;
-      if (input_type_size == output_type_size) {
-        // No change in size.
-        new_shape = input;
-      } else if (input_type_size < output_type_size) {
-        TF_RETURN_IF_ERROR(c->WithRankAtLeast(input, 1, &new_shape));
-
-        int64 divisor_val = output_type_size / input_type_size;
-        DimensionHandle last_dim = c->Dim(new_shape, -1);
-        if (!c->ValueKnown(last_dim) || c->Value(last_dim) == divisor_val) {
-          TF_RETURN_IF_ERROR(c->Subshape(new_shape, 0, -1, &new_shape));
-        } else {
-          return errors::InvalidArgument("Cannot bitcast due to shape. ",
-                                         c->Value(last_dim), " does not match ",
-                                         divisor_val);
-        }
-      } else {
-        // Input type size is larger than output type size.
-        int64 divisor_val = input_type_size / output_type_size;
-        ShapeHandle extension = c->Vector(divisor_val);
-        TF_RETURN_IF_ERROR(c->Concatenate(input, extension, &new_shape));
-      }
-
-      c->set_output(0, new_shape);
-      return Status::OK();
-    });
-
 REGISTER_OP("OneHot")
     .Input("indices: TI")
     .Input("depth: int32")
@@ -2741,10 +2783,21 @@ REGISTER_OP("QuantizeAndDequantizeV2")
         "round_mode: {'HALF_TO_EVEN', 'HALF_UP'} = "
         "'HALF_TO_EVEN'")
     .Attr("narrow_range: bool = false")
+    .Attr("axis: int = -1")
     .SetShapeFn([](InferenceContext* c) {
-      ShapeHandle unused;
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 0, &unused));
+      int axis;
+      TF_RETURN_IF_ERROR(c->GetAttr("axis", &axis));
+      const int minmax_rank = (axis == -1) ? 0 : 1;
+      ShapeHandle minmax;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
+      TF_RETURN_IF_ERROR(c->Merge(c->input(2), minmax, &minmax));
+      if (axis != -1) {
+        ShapeHandle input;
+        TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
+        DimensionHandle depth;
+        TF_RETURN_IF_ERROR(
+            c->Merge(c->Dim(minmax, 0), c->Dim(input, axis), &depth));
+      }
       c->set_output(0, c->input(0));
       return Status::OK();
     });
@@ -2759,10 +2812,22 @@ REGISTER_OP("QuantizeAndDequantizeV3")
     .Output("output: T")
     .Attr("T: {bfloat16, half, float, double}")
     .Attr("narrow_range: bool = false")
+    .Attr("axis: int = -1")
     .SetShapeFn([](InferenceContext* c) {
+      int axis;
+      TF_RETURN_IF_ERROR(c->GetAttr("axis", &axis));
+      const int minmax_rank = (axis == -1) ? 0 : 1;
+      ShapeHandle minmax;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
+      TF_RETURN_IF_ERROR(c->Merge(c->input(2), minmax, &minmax));
+      if (axis != -1) {
+        ShapeHandle input;
+        TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
+        DimensionHandle depth;
+        TF_RETURN_IF_ERROR(
+            c->Merge(c->Dim(minmax, 0), c->Dim(input, axis), &depth));
+      }
       ShapeHandle unused;
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 0, &unused));
       TF_RETURN_IF_ERROR(c->WithRank(c->input(3), 0, &unused));
       c->set_output(0, c->input(0));
       return Status::OK();
@@ -2780,13 +2845,29 @@ REGISTER_OP("QuantizeV2")
     .Attr(
         "round_mode: {'HALF_AWAY_FROM_ZERO', 'HALF_TO_EVEN'} = "
         "'HALF_AWAY_FROM_ZERO'")
+    .Attr("narrow_range: bool = false")
+    .Attr("axis: int = -1")
+    .Attr("ensure_minimum_range: float = 0.01")
     .SetShapeFn([](InferenceContext* c) {
+      int axis = -1;
+      Status s = c->GetAttr("axis", &axis);
+      if (!s.ok() && s.code() != error::NOT_FOUND) {
+        return s;
+      }
+      const int minmax_rank = (axis == -1) ? 0 : 1;
       TF_RETURN_IF_ERROR(shape_inference::UnchangedShape(c));
-      ShapeHandle unused;
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 0, &unused));
-      c->set_output(1, c->Scalar());
-      c->set_output(2, c->Scalar());
+      ShapeHandle minmax;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), minmax_rank, &minmax));
+      if (axis != -1) {
+        ShapeHandle input;
+        TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
+        DimensionHandle depth;
+        TF_RETURN_IF_ERROR(
+            c->Merge(c->Dim(minmax, 0), c->Dim(input, axis), &depth));
+      }
+      c->set_output(1, minmax);
+      c->set_output(2, minmax);
       return Status::OK();
     });
 
@@ -2794,14 +2875,30 @@ REGISTER_OP("Dequantize")
     .Input("input: T")
     .Input("min_range: float")
     .Input("max_range: float")
-    .Output("output: float")
+    .Output("output: dtype")
     .Attr("T: quantizedtype")
     .Attr("mode: {'MIN_COMBINED', 'MIN_FIRST', 'SCALED'} = 'MIN_COMBINED'")
+    .Attr("narrow_range: bool = false")
+    .Attr("axis: int = -1")
+    .Attr("dtype: {bfloat16, float} = DT_FLOAT")
     .SetShapeFn([](InferenceContext* c) {
+      int axis = -1;
+      Status s = c->GetAttr("axis", &axis);
+      if (!s.ok() && s.code() != error::NOT_FOUND) {
+        return s;
+      }
+      const int minmax_rank = (axis == -1) ? 0 : 1;
       TF_RETURN_IF_ERROR(shape_inference::UnchangedShape(c));
-      ShapeHandle unused;
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), 0, &unused));
-      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), 0, &unused));
+      ShapeHandle minmax;
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(1), minmax_rank, &minmax));
+      TF_RETURN_IF_ERROR(c->WithRank(c->input(2), minmax_rank, &minmax));
+      if (axis != -1) {
+        ShapeHandle input;
+        TF_RETURN_IF_ERROR(c->WithRankAtLeast(c->input(0), axis + 1, &input));
+        DimensionHandle depth;
+        TF_RETURN_IF_ERROR(
+            c->Merge(c->Dim(minmax, 0), c->Dim(input, axis), &depth));
+      }
       return Status::OK();
     });
 
@@ -3159,7 +3256,7 @@ REGISTER_OP("Fingerprint")
           return errors::InvalidArgument("`method` must be rank 0: ",
                                          method->shape());
         }
-        const string& method_string = method->scalar<string>()();
+        const string& method_string = method->scalar<tstring>()();
         if (method_string != "farmhash64") {
           return errors::InvalidArgument("Unsupported method: ", method_string);
         }

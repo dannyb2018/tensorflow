@@ -15,6 +15,7 @@ limitations under the License.
 #include "tensorflow/core/kernels/data/map_dataset_op.h"
 
 #include "tensorflow/core/common_runtime/function.h"
+#include "tensorflow/core/common_runtime/input_colocation_exemption_registry.h"
 #include "tensorflow/core/framework/partial_tensor_shape.h"
 #include "tensorflow/core/framework/tensor.h"
 #include "tensorflow/core/kernels/data/dataset_utils.h"
@@ -73,6 +74,11 @@ class MapDatasetOp::Dataset : public DatasetBase {
 
   int64 Cardinality() const override { return input_->Cardinality(); }
 
+  Status CheckExternalState() const override {
+    TF_RETURN_IF_ERROR(captured_func_->CheckExternalState());
+    return input_->CheckExternalState();
+  }
+
  protected:
   Status AsGraphDefInternal(SerializationContext* ctx,
                             DatasetGraphDefBuilder* b,
@@ -122,7 +128,7 @@ class MapDatasetOp::Dataset : public DatasetBase {
 
     Status Initialize(IteratorContext* ctx) override {
       TF_RETURN_IF_ERROR(
-          dataset()->input_->MakeIterator(ctx, prefix(), &input_impl_));
+          dataset()->input_->MakeIterator(ctx, this, prefix(), &input_impl_));
       return dataset()->captured_func_->Instantiate(
           ctx, &instantiated_captured_func_);
     }
@@ -168,8 +174,11 @@ class MapDatasetOp::Dataset : public DatasetBase {
       return model::MakeKnownRatioNode(std::move(args), /*ratio=*/1);
     }
 
-    Status SaveInternal(IteratorStateWriter* writer) override {
-      TF_RETURN_IF_ERROR(SaveInput(writer, input_impl_));
+    Status SaveInternal(SerializationContext* ctx,
+                        IteratorStateWriter* writer) override {
+      TF_RETURN_IF_ERROR(ctx->HandleCheckExternalStateStatus(
+          dataset()->captured_func_->CheckExternalState()));
+      TF_RETURN_IF_ERROR(SaveInput(ctx, writer, input_impl_));
       return Status::OK();
     }
 
@@ -216,12 +225,15 @@ void MapDatasetOp::MakeDataset(OpKernelContext* ctx, DatasetBase* input,
 }
 
 namespace {
+
 REGISTER_KERNEL_BUILDER(Name("MapDataset").Device(DEVICE_CPU), MapDatasetOp);
 REGISTER_KERNEL_BUILDER(Name("ExperimentalMapDataset")
                             .Device(DEVICE_GPU)
                             .HostMemory("input_dataset")
                             .HostMemory("handle"),
                         MapDatasetOp);
+REGISTER_INPUT_COLOCATION_EXEMPTION("MapDataset");
+
 }  // namespace
 }  // namespace data
 }  // namespace tensorflow

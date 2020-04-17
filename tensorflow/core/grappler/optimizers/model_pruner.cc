@@ -29,6 +29,7 @@ limitations under the License.
 #include "tensorflow/core/grappler/mutable_graph_view.h"
 #include "tensorflow/core/grappler/op_types.h"
 #include "tensorflow/core/grappler/utils.h"
+#include "tensorflow/core/grappler/utils/transitive_fanin.h"
 
 namespace tensorflow {
 namespace grappler {
@@ -81,7 +82,7 @@ bool RemovalIncreasesEdgeCount(const NodeDef& node,
   int in_degree =
       graph_view.NumFanins(node, /*include_controlling_nodes=*/true);
   int out_degree =
-      graph_view.NumFanouts(node, /*include_controlling_nodes=*/true);
+      graph_view.NumFanouts(node, /*include_controlled_nodes=*/true);
   return in_degree * out_degree > in_degree + out_degree;
 }
 
@@ -206,12 +207,12 @@ absl::flat_hash_map<string, absl::flat_hash_set<int>> IdentityNTerminalPorts(
   // get pruned later on.
   absl::flat_hash_set<string> visited(terminal_nodes.begin(),
                                       terminal_nodes.end());
-  for (string terminal_node : terminal_nodes) {
+  for (const string& terminal_node : terminal_nodes) {
     NodeDef* node = node_map.GetNode(terminal_node);
     if (node == nullptr) {
       continue;
     }
-    for (string input : node->input()) {
+    for (const string& input : node->input()) {
       to_visit.push_back(input);
     }
   }
@@ -298,7 +299,7 @@ Status RewriteIdentityNAndInputsOutputs(
   // Rewrite IdentityN node and associated inputs and outputs. For inputs and
   // outputs that don't lead to a terminal node, a new Identity node is created
   // and those inputs and outputs are rewritten to use the new Identity node as
-  // their outputs and inputs respectively. For the remaining nodes, the ouputs
+  // their outputs and inputs respectively. For the remaining nodes, the outputs
   // have their inputs updated with the adjusted port, from the IdentityN node
   // having less inputs.
   struct NodeOutputUpdate {
@@ -352,7 +353,7 @@ Status RewriteIdentityNAndInputsOutputs(
     }
   }
 
-  for (NodeOutputUpdate update : updates) {
+  for (const NodeOutputUpdate& update : updates) {
     node_map->AddOutput(update.input, update.output);
   }
 
@@ -406,29 +407,6 @@ Status SplitIdentityNInputs(GraphDef* graph,
     TF_RETURN_IF_ERROR(RewriteIdentityNAndInputsOutputs(
         node, num_non_control_inputs, terminal.second, graph, &node_map));
     *updated_graph = true;
-  }
-
-  return Status::OK();
-}
-
-Status SetTransitiveFaninGraph(const GraphDef& input_graph,
-                               GraphDef* output_graph,
-                               const std::vector<string>& terminal_nodes) {
-  // Determines transitive fanin nodes from terminal nodes and add them to the
-  // output graph.
-  bool ill_formed = false;
-  std::vector<const NodeDef*> keep =
-      ComputeTransitiveFanin(input_graph, terminal_nodes, &ill_formed);
-  if (ill_formed) {
-    // Some graph edges are invalid, or some of the feeds/fetch don't exist:
-    // let's be conservative and preserve the graph as is.
-    return errors::InvalidArgument("Invalid input graph.");
-  }
-  // Try to keep the nodes ordered somewhat topologically since this helps
-  // further optimizations perform better.
-  output_graph->mutable_node()->Reserve(keep.size());
-  for (int i = keep.size() - 1; i >= 0; --i) {
-    *output_graph->add_node() = *keep[i];
   }
 
   return Status::OK();

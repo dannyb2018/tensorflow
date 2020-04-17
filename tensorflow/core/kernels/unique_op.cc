@@ -124,7 +124,7 @@ class UniqueOp : public OpKernel {
                      context->allocate_output(0, output_shape, &output));
       auto Tout = output->flat<T>();
 
-      for (auto it : uniq) {
+      for (const auto& it : uniq) {
         Tout(it.second) = it.first;
       }
     } else {
@@ -236,7 +236,8 @@ class UniqueOp : public OpKernel {
                               .TypeConstraint<int64>("out_idx"), \
                           UniqueOp<type, int64>)
 TF_CALL_REAL_NUMBER_TYPES(REGISTER_UNIQUE);
-REGISTER_UNIQUE(string)
+REGISTER_UNIQUE(tstring)
+REGISTER_UNIQUE(bool)
 #undef REGISTER_UNIQUE
 
 // Fake integer GPU kernels so that the use of Unique in optimizers (to

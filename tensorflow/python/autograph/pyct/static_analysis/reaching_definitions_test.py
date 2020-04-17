@@ -22,6 +22,7 @@ import six
 
 from tensorflow.python.autograph.pyct import anno
 from tensorflow.python.autograph.pyct import cfg
+from tensorflow.python.autograph.pyct import naming
 from tensorflow.python.autograph.pyct import parser
 from tensorflow.python.autograph.pyct import qual_names
 from tensorflow.python.autograph.pyct import transformer
@@ -37,11 +38,17 @@ global_b = 17
 class ReachingDefinitionsAnalyzerTestBase(test.TestCase):
 
   def _parse_and_analyze(self, test_fn):
+    # TODO(mdan): Use a custom FunctionTransformer here.
     node, source = parser.parse_entity(test_fn, future_features=())
     entity_info = transformer.EntityInfo(
-        source_code=source, source_file=None, future_features=(), namespace={})
+        name=test_fn.__name__,
+        source_code=source,
+        source_file=None,
+        future_features=(),
+        namespace={})
     node = qual_names.resolve(node)
-    ctx = transformer.Context(entity_info)
+    namer = naming.Namer({})
+    ctx = transformer.Context(entity_info, namer, None)
     node = activity.resolve(node, ctx)
     graphs = cfg.build(node)
     node = reaching_definitions.resolve(node, ctx, graphs,
@@ -358,16 +365,18 @@ class ReachingDefinitionsAnalyzerTest(ReachingDefinitionsAnalyzerTestBase):
   def test_comprehension_leaking(self):
 
     def test_fn(a):
-      all(x for x in a)
-      return x  # pylint:disable=undefined-variable
+      _ = [x for x in a]
+      return x  # pylint:disable=undefined-loop-variable
 
     node = self._parse_and_analyze(test_fn)
     fn_body = node.body
 
-    listcomp_target = fn_body[0].value.args[0].generators[0].target
+    listcomp_target = fn_body[0].value.generators[0].target
     retval = fn_body[1].value
 
-    # Python2 leaks comprehension symbols. Python3 doesn't.
+    # Python2 leaks list comprehension symbols. Python3 doesn't.
+    # For details, see:
+    # https://stackoverflow.com/questions/4198906/list-comprehension-rebinds-names-even-after-scope-of-comprehension-is-this-righ
     if six.PY2:
       self.assertSameDef(retval, listcomp_target)
     else:

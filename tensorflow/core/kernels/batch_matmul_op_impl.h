@@ -42,9 +42,9 @@ limitations under the License.
 #include "tensorflow/core/kernels/eigen_contraction_kernel.h"
 #endif
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 #include "tensorflow/core/platform/stream_executor.h"
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 namespace tensorflow {
 
@@ -217,7 +217,9 @@ struct LaunchBatchMatMul<CPUDevice, Scalar> {
         in_x.dim_size(1) * in_x.dim_size(2) * out->dim_size(2);
     const int64 small_dim = std::min(
         std::min(in_x.dim_size(1), in_x.dim_size(2)), out->dim_size(2));
-    const int64 kMaxCostOuterParallelism = 128 * 128 * 256;  // heuristic.
+    // NOTE(nikhilsarda): This heuristic is optimal in benchmarks as of
+    // Jan 21, 2020.
+    const int64 kMaxCostOuterParallelism = 128 * 128;  // heuristic.
     auto worker_threads = *(context->device()->tensorflow_cpu_worker_threads());
     if (small_dim > 1 &&
         (batch_size == 1 || cost_per_unit > kMaxCostOuterParallelism)) {
@@ -248,27 +250,27 @@ struct LaunchBatchMatMul<CPUDevice, Scalar> {
   }
 };
 
-#if GOOGLE_CUDA
+#if GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 namespace {
 template <typename T>
-se::DeviceMemory<T> AsDeviceMemory(const T* cuda_memory) {
-  se::DeviceMemoryBase wrapped(const_cast<T*>(cuda_memory));
+se::DeviceMemory<T> AsDeviceMemory(const T* gpu_memory) {
+  se::DeviceMemoryBase wrapped(const_cast<T*>(gpu_memory));
   se::DeviceMemory<T> typed(wrapped);
   return typed;
 }
 
-class CublasScratchAllocator : public se::ScratchAllocator {
+class BlasScratchAllocator : public se::ScratchAllocator {
  public:
   using Stream = se::Stream;
   using DeviceMemoryBytes = se::DeviceMemory<uint8>;
 
-  CublasScratchAllocator(OpKernelContext* context) : context_(context) {}
+  BlasScratchAllocator(OpKernelContext* context) : context_(context) {}
 
-  int64 GetMemoryLimitInBytes(Stream* stream) override { return -1; }
+  int64 GetMemoryLimitInBytes() override { return -1; }
 
   se::port::StatusOr<DeviceMemoryBytes> AllocateBytes(
-      Stream* stream, int64 byte_size) override {
+      int64 byte_size) override {
     Tensor temporary_memory;
 
     Status allocation_status(context_->allocate_temp(
@@ -328,8 +330,26 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
     auto* a_base_ptr = in_x.template flat<Scalar>().data();
     auto* b_base_ptr = in_y.template flat<Scalar>().data();
     auto* c_base_ptr = out->template flat<Scalar>().data();
+    uint64 a_stride;
+    uint64 b_stride;
+    uint64 c_stride;
 
-    if (!bcast.IsBroadcastingRequired()) {
+    bool is_full_broadcast =
+        std::min(bcast.x_batch_size(), bcast.y_batch_size()) == 1;
+    bool use_strided_batched =
+        (!bcast.IsBroadcastingRequired() || is_full_broadcast) &&
+        batch_size > 1;
+    if (use_strided_batched) {
+      a_stride = bcast.x_batch_size() != 1 ? m * k : 0;
+      b_stride = bcast.y_batch_size() != 1 ? k * n : 0;
+      c_stride = m * n;
+      a_device_memory.push_back(AsDeviceMemory(a_base_ptr));
+      b_device_memory.push_back(AsDeviceMemory(b_base_ptr));
+      c_device_memory.push_back(AsDeviceMemory(c_base_ptr));
+      a_ptrs.push_back(&a_device_memory.back());
+      b_ptrs.push_back(&b_device_memory.back());
+      c_ptrs.push_back(&c_device_memory.back());
+    } else if (!bcast.IsBroadcastingRequired()) {
       for (int64 i = 0; i < batch_size; ++i) {
         a_device_memory.push_back(AsDeviceMemory(a_base_ptr + i * m * k));
         b_device_memory.push_back(AsDeviceMemory(b_base_ptr + i * k * n));
@@ -357,7 +377,7 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
 
     typedef Scalar Coefficient;
 
-    // Cublas does
+    // Blas does
     // C = A x B
     // where A, B and C are assumed to be in column major.
     // We want the output to be in row-major, so we can compute
@@ -405,8 +425,25 @@ struct LaunchBatchMatMul<GPUDevice, Scalar> {
               ", k=", k));
         }
       }
+    } else if (use_strided_batched) {
+      bool blas_launch_status =
+          stream
+              ->ThenBlasGemmStridedBatched(
+                  blas_transpose_b, blas_transpose_a, n, m, k,
+                  static_cast<Coefficient>(1.0), *b_ptrs[0], adj_y ? k : n,
+                  b_stride, *a_ptrs[0], adj_x ? m : k, a_stride,
+                  static_cast<Coefficient>(0.0), c_ptrs[0], n, c_stride,
+                  batch_size)
+              .ok();
+      if (!blas_launch_status) {
+        context->SetStatus(errors::Internal(
+            "Blas xGEMMStridedBatched launch failed : a.shape=",
+            in_x.shape().DebugString(),
+            ", b.shape=", in_y.shape().DebugString(), ", m=", m, ", n=", n,
+            ", k=", k, ", batch_size=", batch_size));
+      }
     } else {
-      CublasScratchAllocator scratch_allocator(context);
+      BlasScratchAllocator scratch_allocator(context);
       bool blas_launch_status =
           stream
               ->ThenBlasGemmBatchedWithScratch(
@@ -465,7 +502,26 @@ struct LaunchBatchMatMul<GPUDevice, Eigen::half> {
     auto* b_base_ptr = in_y.template flat<Scalar>().data();
     auto* c_base_ptr = out->template flat<Scalar>().data();
 
-    if (!bcast.IsBroadcastingRequired()) {
+    uint64 a_stride;
+    uint64 b_stride;
+    uint64 c_stride;
+
+    bool is_full_broadcast =
+        std::min(bcast.x_batch_size(), bcast.y_batch_size()) == 1;
+    bool use_strided_batched =
+        (!bcast.IsBroadcastingRequired() || is_full_broadcast) &&
+        batch_size > 1;
+    if (use_strided_batched) {
+      a_stride = bcast.x_batch_size() != 1 ? m * k : 0;
+      b_stride = bcast.y_batch_size() != 1 ? k * n : 0;
+      c_stride = m * n;
+      a_device_memory.push_back(AsDeviceMemory(a_base_ptr));
+      b_device_memory.push_back(AsDeviceMemory(b_base_ptr));
+      c_device_memory.push_back(AsDeviceMemory(c_base_ptr));
+      a_ptrs.push_back(&a_device_memory.back());
+      b_ptrs.push_back(&b_device_memory.back());
+      c_ptrs.push_back(&c_device_memory.back());
+    } else if (!bcast.IsBroadcastingRequired()) {
       for (int64 i = 0; i < batch_size; ++i) {
         a_device_memory.push_back(AsDeviceMemory(a_base_ptr + i * m * k));
         b_device_memory.push_back(AsDeviceMemory(b_base_ptr + i * k * n));
@@ -493,7 +549,7 @@ struct LaunchBatchMatMul<GPUDevice, Eigen::half> {
 
     typedef float Coefficient;
 
-    // Cublas does
+    // Blas does
     // C = A x B
     // where A, B and C are assumed to be in column major.
     // We want the output to be in row-major, so we can compute
@@ -516,8 +572,25 @@ struct LaunchBatchMatMul<GPUDevice, Eigen::half> {
             ", b.shape=", in_y.shape().DebugString(), ", m=", m, ", n=", n,
             ", k=", k));
       }
+    } else if (use_strided_batched) {
+      bool blas_launch_status =
+          stream
+              ->ThenBlasGemmStridedBatched(
+                  blas_transpose_b, blas_transpose_a, n, m, k,
+                  static_cast<Coefficient>(1.0), *b_ptrs[0], adj_y ? k : n,
+                  b_stride, *a_ptrs[0], adj_x ? m : k, a_stride,
+                  static_cast<Coefficient>(0.0), c_ptrs[0], n, c_stride,
+                  batch_size)
+              .ok();
+      if (!blas_launch_status) {
+        context->SetStatus(errors::Internal(
+            "Blas xGEMMStridedBatched launch failed : a.shape=",
+            in_x.shape().DebugString(),
+            ", b.shape=", in_y.shape().DebugString(), ", m=", m, ", n=", n,
+            ", k=", k, ", batch_size=", batch_size));
+      }
     } else {
-      CublasScratchAllocator scratch_allocator(context);
+      BlasScratchAllocator scratch_allocator(context);
       bool blas_launch_status =
           stream
               ->ThenBlasGemmBatchedWithScratch(
@@ -537,7 +610,7 @@ struct LaunchBatchMatMul<GPUDevice, Eigen::half> {
   }
 };
 
-#endif  // GOOGLE_CUDA
+#endif  // GOOGLE_CUDA || TENSORFLOW_USE_ROCM
 
 #ifdef TENSORFLOW_USE_SYCL
 template <typename Scalar>

@@ -1,11 +1,11 @@
+load("//tensorflow:tensorflow.bzl", "tf_cc_test")
+
 package(
     default_visibility = [
         "//tensorflow/compiler/tf2xla:internal",
     ],
     licenses = ["notice"],  # Apache 2.0
 )
-
-load("//tensorflow:tensorflow.bzl", "tf_cc_test")
 
 cc_library(
     name = "graphcycles",
@@ -18,6 +18,7 @@ cc_library(
         "@com_google_absl//absl/container:flat_hash_set",
         "@com_google_absl//absl/container:inlined_vector",
         "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/types:optional",
         "@com_google_absl//absl/types:span",
     ],
 )

@@ -59,7 +59,6 @@ class SquareRootOpTest(test.TestCase):
     self._verifySquareRootReal(matrix1)
     self._verifySquareRootReal(matrix2)
     self._verifySquareRootReal(self._makeBatch(matrix1, matrix2))
-    # Complex
     matrix1 = matrix1.astype(np.complex64)
     matrix2 = matrix2.astype(np.complex64)
     matrix1 += 1j * matrix1

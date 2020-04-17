@@ -70,6 +70,10 @@ struct NodeState {
   // Each output port uses up memory space from time_scheduled to its
   // time_no_references.
 
+  Costs node_costs;  // Node costs per execution
+  Costs TotalNodeCosts() const {
+    return MultiplyCosts(node_costs, execution_count);
+  }
   // How many times this node has been executed, e.g. in a while loop.
   int execution_count;
 
@@ -252,6 +256,7 @@ class PriorityReadyManager : public HeapReadyManager {
  public:
   PriorityReadyManager() : HeapReadyManager() {}
   ~PriorityReadyManager() override {}
+  void AddNode(const NodeDef* node) override;
 
   // Note this should be called after Init().
   Status SetPriority(const std::unordered_map<string, int>& node_priority);
@@ -260,7 +265,7 @@ class PriorityReadyManager : public HeapReadyManager {
   std::function<bool(const NodeDef*, const NodeDef*)> Greater() override;
 
  private:
-  // A map from unique node name to unique priority. Lower number means higher
+  // A map from unique node name to priority. Lower number means higher
   // priority.
   std::unordered_map<string, int> node_priority_;
 };
@@ -335,13 +340,15 @@ class VirtualScheduler {
   // Like the above, but writes detailed stats to RunMetadata.
   // If metadata is nullptr, then just calls and return Summary().
   Costs Summary(RunMetadata* metadata);
-  // Generate RunMetadata's step_stats and partition_graphs fields from results
+  // Generates RunMetadata's step_stats and partition_graphs fields from results
   // of the virtual execution of the graph.
   void GenerateRunMetadata(RunMetadata* metadata);
 
-  // Return per device peak memory usage.
+  // Returns per device memory usage.
   const std::unordered_map<string, int64> GetPeakMemoryUsage() const;
+  const std::unordered_map<string, int64> GetPersistentMemoryUsage() const;
 
+  // Returns VirtualScheduler (read only) device and node states.
   const std::unordered_map<string, DeviceState>* GetDeviceStates() const {
     return &device_;
   }
